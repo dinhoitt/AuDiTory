@@ -1,4 +1,14 @@
 # models/pipeline.py
+"""
+Audio-to-Storyboard Generation Pipeline
+with Consistent Self-Attention for character consistency
+
+핵심 변경: 4프레임을 [B*4, ...] Flat Batch로 처리
+- 기존: 2x2 그리드로 병합 [B, 4, 128, 128]
+- 변경: Flat batch [B*4, 4, 64, 64]로 처리
+- Consistent Self-Attention이 배치 내에서 자동으로 프레임 간 참조
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,7 +20,9 @@ from .storyboard_unet import StoryboardUNet
 class AudioToStoryboardPipeline(nn.Module):
     """
     Audio-to-Storyboard Generation Pipeline
-    with Consistent Self-Attention for character consistency
+    
+    4프레임을 동시에 생성하며, Consistent Self-Attention으로
+    캐릭터 일관성을 자동으로 유지
     """
     
     def __init__(
@@ -20,6 +32,7 @@ class AudioToStoryboardPipeline(nn.Module):
         freeze_unet: bool = True,
         use_consistent_attention: bool = True,
         num_frames: int = 4,
+        attention_mode: str = "first",  # "first" or "mutual"
     ):
         super().__init__()
         
@@ -30,7 +43,7 @@ class AudioToStoryboardPipeline(nn.Module):
                 'output_dim': 768,
                 'num_layers': 6,
                 'num_heads': 8,
-                'output_seq_len': 77  # CLIP과 동일
+                'output_seq_len': 77
             }
         
         self.num_frames = num_frames
@@ -45,15 +58,16 @@ class AudioToStoryboardPipeline(nn.Module):
             freeze_unet=freeze_unet,
             use_consistent_attention=use_consistent_attention,
             num_frames=num_frames,
+            attention_mode=attention_mode,
         )
         
-        # 3. Scheduler - DDIM 사용 (SD v1.5와 호환)
+        # 3. Scheduler
         self.scheduler = DDIMScheduler.from_pretrained(
             pretrained_model,
             subfolder="scheduler"
         )
         
-        # 4. Learnable null embedding (CFG용)
+        # 4. Learnable null embeddings (CFG용)
         self.null_audio_embed = nn.Parameter(torch.randn(1, 77, 768) * 0.02)
         self.null_text_embed = nn.Parameter(torch.randn(1, 77, 768) * 0.02)
         
@@ -64,26 +78,27 @@ class AudioToStoryboardPipeline(nn.Module):
         # 6. Latent scaling factor
         self.vae_scale_factor = 0.18215
     
-    
     def forward(
         self,
         mel: torch.Tensor = None,
         latent: torch.Tensor = None,
         text_embed: torch.Tensor = None,
         mel_mask: torch.Tensor = None,
-        conditioning_mode: str = "audio"  # "audio", "text", "both"
+        conditioning_mode: str = "audio"
     ) -> dict:
         """
         학습용 Forward pass
         
-        Note: 학습 시에는 Consistent Self-Attention의 효과가 자동으로 적용됩니다.
-        4개의 프레임이 배치로 들어오면, self-attention이 모든 프레임 간
-        features를 공유하게 됩니다.
-        
         Args:
+            mel: [B, 128, T] - Mel-spectrogram (하나의 오디오가 4프레임에 공유)
+            latent: [B, 4, 4, 64, 64] - 4프레임의 VAE latent
+            text_embed: [B, 77, 768] - Text embedding (4프레임에 공유)
+            mel_mask: [B, T] - Mel padding mask
             conditioning_mode: "audio", "text", or "both"
+        
+        Returns:
+            dict with 'loss', 'noise_pred', 'noise', 'timesteps'
         """
-        # Determine batch size and device from available inputs
         if mel is not None:
             B = mel.shape[0]
             device = mel.device
@@ -98,22 +113,36 @@ class AudioToStoryboardPipeline(nn.Module):
         if conditioning_mode in ["audio", "both"]:
             if mel is None:
                 raise ValueError(f"mel required for '{conditioning_mode}' mode")
+            # [B, 77, 768]
             audio_embeds = self.audio_encoder(mel, mel_mask)
         
-        # 2. Storyboard latent 준비
-        storyboard_latent = self._merge_latents(latent)
+        # 2. Latent 준비: [B, 4, 4, 64, 64] → [B*4, 4, 64, 64]
+        # 각 프레임을 별도 배치로 펼침
+        flat_latent = latent.view(B * self.num_frames, 4, 64, 64)
         
-        # 3. Random timestep
+        # 3. Embedding 확장: [B, 77, 768] → [B*4, 77, 768]
+        # 같은 conditioning을 4프레임에 공유
+        if audio_embeds is not None:
+            audio_embeds = audio_embeds.unsqueeze(1).expand(-1, self.num_frames, -1, -1)
+            audio_embeds = audio_embeds.reshape(B * self.num_frames, 77, 768)
+        
+        if text_embed is not None:
+            text_embed = text_embed.unsqueeze(1).expand(-1, self.num_frames, -1, -1)
+            text_embed = text_embed.reshape(B * self.num_frames, 77, 768)
+        
+        # 4. Random timestep (모든 프레임에 동일한 timestep 사용)
         timesteps = torch.randint(
             0, self.scheduler.config.num_train_timesteps,
             (B,), device=device, dtype=torch.long
         )
+        # [B] → [B*4]
+        timesteps = timesteps.unsqueeze(1).expand(-1, self.num_frames).reshape(-1)
         
-        # 4. Noise 추가
-        noise = torch.randn_like(storyboard_latent)
-        noisy_latent = self.scheduler.add_noise(storyboard_latent, noise, timesteps)
+        # 5. Noise 추가
+        noise = torch.randn_like(flat_latent)
+        noisy_latent = self.scheduler.add_noise(flat_latent, noise, timesteps)
         
-        # 5. Noise 예측
+        # 6. Noise 예측 (Consistent Self-Attention이 자동 적용)
         noise_pred = self.storyboard_unet(
             sample=noisy_latent,
             timestep=timesteps,
@@ -122,7 +151,7 @@ class AudioToStoryboardPipeline(nn.Module):
             conditioning_mode=conditioning_mode
         )
         
-        # 6. Loss
+        # 7. Loss
         loss = F.mse_loss(noise_pred, noise)
         
         return {
@@ -131,19 +160,6 @@ class AudioToStoryboardPipeline(nn.Module):
             'noise': noise,
             'timesteps': timesteps
         }
-    
-    def _merge_latents(self, latent: torch.Tensor) -> torch.Tensor:
-        """[B, 4, 4, 64, 64] → [B, 4, 128, 128]"""
-        top = torch.cat([latent[:, 0], latent[:, 1]], dim=-1)
-        bottom = torch.cat([latent[:, 2], latent[:, 3]], dim=-1)
-        return torch.cat([top, bottom], dim=-2)
-    
-    def _split_latents(self, storyboard: torch.Tensor) -> torch.Tensor:
-        """[B, 4, 128, 128] → [B, 4, 4, 64, 64]"""
-        top, bottom = storyboard.chunk(2, dim=-2)
-        frame_0, frame_1 = top.chunk(2, dim=-1)
-        frame_2, frame_3 = bottom.chunk(2, dim=-1)
-        return torch.stack([frame_0, frame_1, frame_2, frame_3], dim=1)
     
     @torch.no_grad()
     def generate(
@@ -154,20 +170,29 @@ class AudioToStoryboardPipeline(nn.Module):
         guidance_scale: float = 7.5,
         generator: torch.Generator = None,
         conditioning_mode: str = "audio",
-        use_consistent_attention: bool = None,  # Override default setting
+        use_consistent_attention: bool = None,
     ) -> torch.Tensor:
         """
-        추론: Audio/Text → Storyboard with Consistent Self-Attention
+        추론: Audio/Text → 4-frame Storyboard
         
-        Consistent Self-Attention은 denoising 과정에서 자동으로 적용됩니다.
+        Args:
+            mel: [B, 128, T] - Mel-spectrogram
+            text_embed: [B, 77, 768] - Text embedding
+            num_inference_steps: Denoising steps
+            guidance_scale: CFG scale
+            generator: Random generator
+            conditioning_mode: "audio", "text", or "both"
+            use_consistent_attention: Override default (None = use default)
+        
+        Returns:
+            images: [B, 4, 3, 512, 512] - 4 frames of generated images
         """
         
-        # Override consistent attention setting if specified
+        # Override consistent attention if specified
         if use_consistent_attention is not None:
-            _original_setting = self.use_consistent_attention
-            if use_consistent_attention and not self.use_consistent_attention:
+            if use_consistent_attention and not self.storyboard_unet.use_consistent_attention:
                 self.storyboard_unet.enable_consistent_attention()
-            elif not use_consistent_attention and self.use_consistent_attention:
+            elif not use_consistent_attention and self.storyboard_unet.use_consistent_attention:
                 self.storyboard_unet.disable_consistent_attention()
         
         # Determine batch size and device
@@ -187,59 +212,58 @@ class AudioToStoryboardPipeline(nn.Module):
             ).to(device)
             self.vae.eval()
         
-        # 1. Audio encoding (if needed)
+        # 1. Audio encoding
         audio_embeds = None
         if conditioning_mode in ["audio", "both"]:
             if mel is None:
                 raise ValueError(f"mel required for '{conditioning_mode}' mode")
             audio_embeds = self.audio_encoder(mel)
+            # [B, 77, 768] → [B*4, 77, 768]
+            audio_embeds = audio_embeds.unsqueeze(1).expand(-1, self.num_frames, -1, -1)
+            audio_embeds = audio_embeds.reshape(B * self.num_frames, 77, 768)
         
-        # 2. 초기 noise
-        latent_shape = (B, 4, 128, 128)
+        # Text embedding 확장
+        if text_embed is not None:
+            text_embed = text_embed.unsqueeze(1).expand(-1, self.num_frames, -1, -1)
+            text_embed = text_embed.reshape(B * self.num_frames, 77, 768)
+        
+        # 2. 초기 noise: [B*4, 4, 64, 64]
+        latent_shape = (B * self.num_frames, 4, 64, 64)
         latents = torch.randn(latent_shape, device=device, generator=generator)
         
         # 3. Scheduler 설정
         self.scheduler.set_timesteps(num_inference_steps)
         latents = latents * self.scheduler.init_noise_sigma
         
-        # 4. Null embedding for CFG
-        null_embed = self.null_audio_embed.expand(B, -1, -1).to(device)
+        # 4. Null embeddings 준비
+        null_audio = self.null_audio_embed.expand(B * self.num_frames, -1, -1).to(device)
+        null_text = self.null_text_embed.expand(B * self.num_frames, -1, -1).to(device)
         
-        # 5. Reset consistent attention for new generation
-        if self.use_consistent_attention:
-            self.storyboard_unet.reset_attention_bank()
-        
-        # 6. Denoising loop with Consistent Self-Attention
-        for step_idx, t in enumerate(self.scheduler.timesteps):
+        # 5. Denoising loop
+        for t in self.scheduler.timesteps:
             t_tensor = t.to(device)
-            
-            # Update attention step (for consistent attention)
-            if self.use_consistent_attention and self.storyboard_unet.ca_manager:
-                self.storyboard_unet.ca_manager.cur_step = step_idx
-                self.storyboard_unet.ca_manager._update_processors()
+            # [B*4]
+            timestep_batch = t_tensor.expand(B * self.num_frames)
             
             if guidance_scale > 1.0:
+                # CFG: [B*4*2, ...]
                 latent_input = torch.cat([latents] * 2)
+                timestep_input = torch.cat([timestep_batch] * 2)
                 
-                # Prepare conditional/unconditional inputs based on mode
+                # Prepare conditional/unconditional inputs
                 if conditioning_mode == "audio":
-                    cond_embed = audio_embeds
-                    uncond_embed = null_embed
-                    audio_input = torch.cat([uncond_embed, cond_embed])
+                    audio_input = torch.cat([null_audio, audio_embeds])
                     text_input = None
                 elif conditioning_mode == "text":
-                    cond_embed = text_embed
-                    uncond_embed = self.null_text_embed.expand(B, -1, -1).to(device)
                     audio_input = None
-                    text_input = torch.cat([uncond_embed, cond_embed])
+                    text_input = torch.cat([null_text, text_embed])
                 else:  # both
-                    audio_input = torch.cat([null_embed, audio_embeds])
-                    null_text = self.null_text_embed.expand(B, -1, -1).to(device)
+                    audio_input = torch.cat([null_audio, audio_embeds])
                     text_input = torch.cat([null_text, text_embed])
                 
                 noise_pred = self.storyboard_unet(
                     latent_input,
-                    t_tensor.expand(B * 2),
+                    timestep_input,
                     audio_input,
                     text_input,
                     conditioning_mode=conditioning_mode
@@ -250,7 +274,7 @@ class AudioToStoryboardPipeline(nn.Module):
             else:
                 noise_pred = self.storyboard_unet(
                     latents,
-                    t_tensor.expand(B),
+                    timestep_batch,
                     audio_embeds,
                     text_embed,
                     conditioning_mode=conditioning_mode
@@ -258,50 +282,38 @@ class AudioToStoryboardPipeline(nn.Module):
             
             latents = self.scheduler.step(noise_pred, t, latents).prev_sample
         
-        # 7. VAE decode
+        # 6. VAE decode: [B*4, 4, 64, 64] → [B*4, 3, 512, 512]
         latents = latents / self.vae_scale_factor
-        frame_latents = self._split_latents(latents)
         
         images = []
-        for i in range(4):
-            frame = self.vae.decode(frame_latents[:, i]).sample
+        for i in range(B * self.num_frames):
+            frame = self.vae.decode(latents[i:i+1]).sample
             frame = (frame / 2 + 0.5).clamp(0, 1)
             images.append(frame)
         
-        # Restore original setting if overridden
-        if use_consistent_attention is not None:
-            if _original_setting and not use_consistent_attention:
-                self.storyboard_unet.enable_consistent_attention()
-            elif not _original_setting and use_consistent_attention:
-                self.storyboard_unet.disable_consistent_attention()
+        # [B*4, 3, 512, 512] → [B, 4, 3, 512, 512]
+        images = torch.cat(images, dim=0)
+        images = images.view(B, self.num_frames, 3, 512, 512)
         
-        return torch.stack(images, dim=1)
+        return images
     
     @torch.no_grad()
-    def generate_with_reference(
+    def generate_single_frame(
         self,
         mel: torch.Tensor = None,
         text_embed: torch.Tensor = None,
-        reference_latents: torch.Tensor = None,
+        frame_idx: int = 0,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
         generator: torch.Generator = None,
         conditioning_mode: str = "audio",
-        reference_strength: float = 0.5,
     ) -> torch.Tensor:
         """
-        Generate with reference frames for stronger consistency
+        단일 프레임 생성 (테스트/디버깅용)
         
-        Two-pass generation:
-        1. First pass (write mode): Generate reference frames and store features
-        2. Second pass (read mode): Generate remaining frames using stored features
-        
-        Args:
-            reference_latents: Optional pre-computed reference latents
-            reference_strength: Strength of reference features (0~1)
+        Returns:
+            image: [B, 3, 512, 512]
         """
-        
-        # Determine batch size and device
         if mel is not None:
             device = mel.device
             B = mel.shape[0]
@@ -311,139 +323,73 @@ class AudioToStoryboardPipeline(nn.Module):
         else:
             raise ValueError("At least one of mel or text_embed must be provided")
         
-        # VAE lazy loading
         if self.vae is None:
             self.vae = AutoencoderKL.from_pretrained(
                 self.pretrained_model, subfolder="vae"
             ).to(device)
             self.vae.eval()
         
+        # Disable consistent attention for single frame
+        self.storyboard_unet.disable_consistent_attention()
+        
         # Audio encoding
         audio_embeds = None
         if conditioning_mode in ["audio", "both"]:
-            if mel is None:
-                raise ValueError(f"mel required for '{conditioning_mode}' mode")
             audio_embeds = self.audio_encoder(mel)
         
         # Initial noise
-        latent_shape = (B, 4, 128, 128)
-        latents = torch.randn(latent_shape, device=device, generator=generator)
+        latents = torch.randn((B, 4, 64, 64), device=device, generator=generator)
         
-        # Scheduler setup
         self.scheduler.set_timesteps(num_inference_steps)
         latents = latents * self.scheduler.init_noise_sigma
         
-        # Null embedding for CFG
-        null_embed = self.null_audio_embed.expand(B, -1, -1).to(device)
+        null_audio = self.null_audio_embed.expand(B, -1, -1).to(device)
+        null_text = self.null_text_embed.expand(B, -1, -1).to(device)
         
-        # Reset consistent attention
-        if self.use_consistent_attention:
-            self.storyboard_unet.reset_attention_bank()
-            # Set to write mode for first pass
-            self.storyboard_unet.set_attention_mode(write=True)
-        
-        # Determine encoder hidden states
-        if conditioning_mode == "audio":
-            encoder_hidden_states = audio_embeds
-            null_states = null_embed
-        elif conditioning_mode == "text":
-            encoder_hidden_states = text_embed
-            null_states = self.null_text_embed.expand(B, -1, -1).to(device)
-        else:  # both
-            encoder_hidden_states = (audio_embeds + text_embed) / 2
-            null_states = (null_embed + self.null_text_embed.expand(B, -1, -1).to(device)) / 2
-        
-        # === First Pass: Write mode (store features) ===
-        print("🎬 First pass: Storing reference features...")
-        for step_idx, t in enumerate(self.scheduler.timesteps):
-            t_tensor = t.to(device)
-            
-            if self.use_consistent_attention and self.storyboard_unet.ca_manager:
-                self.storyboard_unet.ca_manager.cur_step = step_idx
-                self.storyboard_unet.ca_manager.write_mode = True
-                self.storyboard_unet.ca_manager._update_processors()
+        for t in self.scheduler.timesteps:
+            t_tensor = t.to(device).expand(B)
             
             if guidance_scale > 1.0:
                 latent_input = torch.cat([latents] * 2)
-                hidden_input = torch.cat([null_states, encoder_hidden_states])
+                timestep_input = torch.cat([t_tensor] * 2)
                 
-                noise_pred = self.storyboard_unet.forward_with_consistent_attention(
+                if conditioning_mode == "audio":
+                    audio_input = torch.cat([null_audio, audio_embeds])
+                    text_input = None
+                elif conditioning_mode == "text":
+                    audio_input = None
+                    text_input = torch.cat([null_text, text_embed])
+                else:
+                    audio_input = torch.cat([null_audio, audio_embeds])
+                    text_input = torch.cat([null_text, text_embed])
+                
+                noise_pred = self.storyboard_unet(
                     latent_input,
-                    t_tensor.expand(B * 2),
-                    hidden_input,
-                    write_mode=True,
-                    cur_step=step_idx,
+                    timestep_input,
+                    audio_input,
+                    text_input,
+                    conditioning_mode=conditioning_mode
                 )
                 
                 noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
-                noise_pred = self.storyboard_unet.forward_with_consistent_attention(
+                noise_pred = self.storyboard_unet(
                     latents,
-                    t_tensor.expand(B),
-                    encoder_hidden_states,
-                    write_mode=True,
-                    cur_step=step_idx,
-                )
-            
-            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-        
-        # Store first pass results
-        first_pass_latents = latents.clone()
-        
-        # === Second Pass: Read mode (use stored features) ===
-        print("🎬 Second pass: Using stored features for consistency...")
-        
-        # Re-initialize latents with some noise for variation
-        latents = torch.randn(latent_shape, device=device, generator=generator)
-        latents = latents * self.scheduler.init_noise_sigma
-        
-        # Blend with first pass for continuity
-        blend_factor = reference_strength
-        
-        self.scheduler.set_timesteps(num_inference_steps)
-        
-        for step_idx, t in enumerate(self.scheduler.timesteps):
-            t_tensor = t.to(device)
-            
-            if self.use_consistent_attention and self.storyboard_unet.ca_manager:
-                self.storyboard_unet.ca_manager.cur_step = step_idx
-                self.storyboard_unet.ca_manager.write_mode = False  # Read mode
-                self.storyboard_unet.ca_manager._update_processors()
-            
-            if guidance_scale > 1.0:
-                latent_input = torch.cat([latents] * 2)
-                hidden_input = torch.cat([null_states, encoder_hidden_states])
-                
-                noise_pred = self.storyboard_unet.forward_with_consistent_attention(
-                    latent_input,
-                    t_tensor.expand(B * 2),
-                    hidden_input,
-                    write_mode=False,
-                    cur_step=step_idx,
-                )
-                
-                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
-            else:
-                noise_pred = self.storyboard_unet.forward_with_consistent_attention(
-                    latents,
-                    t_tensor.expand(B),
-                    encoder_hidden_states,
-                    write_mode=False,
-                    cur_step=step_idx,
+                    t_tensor,
+                    audio_embeds,
+                    text_embed,
+                    conditioning_mode=conditioning_mode
                 )
             
             latents = self.scheduler.step(noise_pred, t, latents).prev_sample
         
         # VAE decode
         latents = latents / self.vae_scale_factor
-        frame_latents = self._split_latents(latents)
+        images = self.vae.decode(latents).sample
+        images = (images / 2 + 0.5).clamp(0, 1)
         
-        images = []
-        for i in range(4):
-            frame = self.vae.decode(frame_latents[:, i]).sample
-            frame = (frame / 2 + 0.5).clamp(0, 1)
-            images.append(frame)
+        # Re-enable consistent attention
+        self.storyboard_unet.enable_consistent_attention()
         
-        return torch.stack(images, dim=1)
+        return images

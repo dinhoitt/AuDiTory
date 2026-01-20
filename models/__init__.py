@@ -5,9 +5,8 @@ from .pipeline import AudioToStoryboardPipeline
 from .consistent_attention import (
     ConsistentSelfAttentionProcessor,
     StandardAttentionProcessor,
-    ConsistentAttentionManager,
-    set_consistent_attention_processor,
-    clear_attention_bank,
+    set_consistent_attention,
+    remove_consistent_attention,
 )
 
 __all__ = [
@@ -16,7 +15,6 @@ __all__ = [
     'AudioToStoryboardPipeline',
     'ConsistentSelfAttentionProcessor',
     'StandardAttentionProcessor',
-    'ConsistentAttentionManager',
-    'set_consistent_attention_processor',
-    'clear_attention_bank',
+    'set_consistent_attention',
+    'remove_consistent_attention',
 ]

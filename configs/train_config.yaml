@@ -18,6 +18,7 @@ model:
   use_lora: false
   use_consistent_attention: true  # Consistent Self-Attention for character consistency
   num_frames: 4  # Number of frames in storyboard
+  attention_mode: "first"  # "first" (첫 장 참조) or "mutual" (상호 참조)
 
 training:
   batch_size: 2
