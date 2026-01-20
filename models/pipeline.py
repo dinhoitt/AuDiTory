@@ -1,18 +1,14 @@
+# models/pipeline.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers import DDPMScheduler, AutoencoderKL
+from diffusers import AutoencoderKL, DDIMScheduler
 from .audio_encoder import AudioEncoder
 from .storyboard_unet import StoryboardUNet
 
 class AudioToStoryboardPipeline(nn.Module):
     """
     Audio-to-Storyboard Generation Pipeline
-    
-    기능:
-    1. Audio Encoder로 오디오 특징 추출
-    2. U-Net을 통해 노이즈 예측 (학습)
-    3. DDPMScheduler를 이용한 노이즈 추가/제거 (학습/추론)
     """
     
     def __init__(
@@ -23,7 +19,6 @@ class AudioToStoryboardPipeline(nn.Module):
     ):
         super().__init__()
         
-        # 1. Audio Encoder Config 설정
         if audio_encoder_config is None:
             audio_encoder_config = {
                 'mel_channels': 128,
@@ -31,144 +26,211 @@ class AudioToStoryboardPipeline(nn.Module):
                 'output_dim': 768,
                 'num_layers': 6,
                 'num_heads': 8,
-                'num_segments': 4
+                'output_seq_len': 77  # CLIP과 동일
             }
         
-        # 2. 모델 초기화
+        # 1. Audio Encoder
         self.audio_encoder = AudioEncoder(**audio_encoder_config)
-        self.storyboard_unet = StoryboardUNet(pretrained_model, freeze_unet)
         
-        # 3. Noise Scheduler (학습 및 추론용)
-        self.scheduler = DDPMScheduler.from_pretrained(
-            pretrained_model, subfolder="scheduler"
+        # 2. U-Net
+        self.storyboard_unet = StoryboardUNet(
+            pretrained_model=pretrained_model,
+            freeze_unet=freeze_unet
         )
         
-        # 4. VAE (추론 시에만 로드, 학습 시에는 전처리된 Latent 사용)
-        self.vae = None 
+        # 3. Scheduler - DDIM 사용 (SD v1.5와 호환)
+        self.scheduler = DDIMScheduler.from_pretrained(
+            pretrained_model,
+            subfolder="scheduler"
+        )
+        
+        # 4. Learnable null embedding (CFG용)
+        self.null_audio_embed = nn.Parameter(torch.randn(1, 77, 768) * 0.02)
+        self.null_text_embed = nn.Parameter(torch.randn(1, 77, 768) * 0.02)
+        
+        # 5. VAE (추론 시 lazy loading)
+        self.vae = None
         self.pretrained_model = pretrained_model
         
+        # 6. Latent scaling factor
+        self.vae_scale_factor = 0.18215
+    
+    
     def forward(
-        self, 
-        mel: torch.Tensor,          # [B, 128, T]
-        latent: torch.Tensor,       # [B, 4, 4, 64, 64] (Clean Latent)
-        text_embed: torch.Tensor,   # [B, 77, 768]
-        mel_mask: torch.Tensor = None
-    ):
+        self,
+        mel: torch.Tensor = None,
+        latent: torch.Tensor = None,
+        text_embed: torch.Tensor = None,
+        mel_mask: torch.Tensor = None,
+        conditioning_mode: str = "audio"  # "audio", "text", "both"
+    ) -> dict:
         """
-        [학습 모드] Forward Pass & Loss Calculation
+        학습용 Forward pass
+        
+        Args:
+            conditioning_mode: "audio", "text", or "both"
         """
-        device = latent.device
-        B, NumFrames, C, H, W = latent.shape # NumFrames=4
+        # Determine batch size and device from available inputs
+        if mel is not None:
+            B = mel.shape[0]
+            device = mel.device
+        elif text_embed is not None:
+            B = text_embed.shape[0]
+            device = text_embed.device
+        else:
+            raise ValueError("At least one of mel or text_embed must be provided")
         
-        # 1. Audio Encoding
-        # [B, 128, T] -> [B, 4, 768]
-        audio_emb = self.audio_encoder(mel, mel_mask)
+        # 1. Audio encoding (if needed)
+        audio_embeds = None
+        if conditioning_mode in ["audio", "both"]:
+            if mel is None:
+                raise ValueError(f"mel required for '{conditioning_mode}' mode")
+            audio_embeds = self.audio_encoder(mel, mel_mask)
         
-        # 2. Inputs Flattening (Batch * 4)
-        # 스토리보드 4컷을 개별 이미지처럼 처리하기 위해 Batch 차원으로 펼칩니다.
-        # Latent: [B, 4, 4, 64, 64] -> [B*4, 4, 64, 64]
-        latents_flat = latent.view(-1, C, H, W)
+        # 2. Storyboard latent 준비
+        storyboard_latent = self._merge_latents(latent)
         
-        # Conditions 확장 (Repeat)
-        # Audio: [B, 4, 768] -> [B*4, 4, 768] (모든 컷이 전체 오디오 맥락을 봄)
-        audio_emb_flat = audio_emb.repeat_interleave(NumFrames, dim=0)
-        
-        # Text: [B, 77, 768] -> [B*4, 77, 768]
-        text_embed_flat = text_embed.repeat_interleave(NumFrames, dim=0)
-        
-        # 3. Noise Injection (Diffusion Process)
-        noise = torch.randn_like(latents_flat)
+        # 3. Random timestep
         timesteps = torch.randint(
-            0, self.scheduler.config.num_train_timesteps, 
-            (latents_flat.shape[0],), device=device
-        ).long()
-        
-        noisy_latents = self.scheduler.add_noise(latents_flat, noise, timesteps)
-        
-        # 4. Predict Noise (U-Net)
-        # storyboard_unet 내부에서 Audio와 Text가 Concat되어 처리됨
-        noise_pred = self.storyboard_unet(
-            sample=noisy_latents,
-            timestep=timesteps,
-            audio_embeds=audio_emb_flat,
-            text_embeds=text_embed_flat
+            0, self.scheduler.config.num_train_timesteps,
+            (B,), device=device, dtype=torch.long
         )
         
-        # 5. Loss Calculation (MSE)
+        # 4. Noise 추가
+        noise = torch.randn_like(storyboard_latent)
+        noisy_latent = self.scheduler.add_noise(storyboard_latent, noise, timesteps)
+        
+        # 5. Noise 예측
+        noise_pred = self.storyboard_unet(
+            sample=noisy_latent,
+            timestep=timesteps,
+            audio_embeds=audio_embeds,
+            text_embeds=text_embed,
+            conditioning_mode=conditioning_mode
+        )
+        
+        # 6. Loss
         loss = F.mse_loss(noise_pred, noise)
         
-        return {"loss": loss}
-
+        return {
+            'loss': loss,
+            'noise_pred': noise_pred,
+            'noise': noise,
+            'timesteps': timesteps
+        }
+    
+    def _merge_latents(self, latent: torch.Tensor) -> torch.Tensor:
+        """[B, 4, 4, 64, 64] → [B, 4, 128, 128]"""
+        top = torch.cat([latent[:, 0], latent[:, 1]], dim=-1)
+        bottom = torch.cat([latent[:, 2], latent[:, 3]], dim=-1)
+        return torch.cat([top, bottom], dim=-2)
+    
+    def _split_latents(self, storyboard: torch.Tensor) -> torch.Tensor:
+        """[B, 4, 128, 128] → [B, 4, 4, 64, 64]"""
+        top, bottom = storyboard.chunk(2, dim=-2)
+        frame_0, frame_1 = top.chunk(2, dim=-1)
+        frame_2, frame_3 = bottom.chunk(2, dim=-1)
+        return torch.stack([frame_0, frame_1, frame_2, frame_3], dim=1)
+    
     @torch.no_grad()
     def generate(
         self,
-        mel: torch.Tensor,
-        text_embed: torch.Tensor,
+        mel: torch.Tensor = None,
+        text_embed: torch.Tensor = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
-        generator: torch.Generator = None
-    ):
-        """
-        [추론 모드] Audio -> Images Generation
-        """
-        device = mel.device
-        B = mel.shape[0]
-        NumFrames = 4
+        generator: torch.Generator = None,
+        conditioning_mode: str = "audio"  # 추가
+    ) -> torch.Tensor:
+        """추론: Audio/Text → Storyboard"""
         
-        # VAE 로드 (필요 시)
+        # Determine batch size and device
+        if mel is not None:
+            device = mel.device
+            B = mel.shape[0]
+        elif text_embed is not None:
+            device = text_embed.device
+            B = text_embed.shape[0]
+        else:
+            raise ValueError("At least one of mel or text_embed must be provided")
+        
+        # VAE lazy loading
         if self.vae is None:
             self.vae = AutoencoderKL.from_pretrained(
                 self.pretrained_model, subfolder="vae"
             ).to(device)
             self.vae.eval()
-            
-        # 1. Audio Encoding
-        audio_emb = self.audio_encoder(mel) # [B, 4, 768]
         
-        # 2. Conditions 준비 (Flatten)
-        # [B*4, 4, 768]
-        audio_emb_flat = audio_emb.repeat_interleave(NumFrames, dim=0)
-        # [B*4, 77, 768]
-        text_embed_flat = text_embed.repeat_interleave(NumFrames, dim=0)
+        # 1. Audio encoding (if needed)
+        audio_embeds = None
+        if conditioning_mode in ["audio", "both"]:
+            if mel is None:
+                raise ValueError(f"mel required for '{conditioning_mode}' mode")
+            audio_embeds = self.audio_encoder(mel)
         
-        # 3. 초기 Noise 생성
-        # [B*4, 4, 64, 64]
-        latents = torch.randn(
-            (B * NumFrames, 4, 64, 64), 
-            device=device, 
-            generator=generator
-        )
+        # 2. 초기 noise
+        latent_shape = (B, 4, 128, 128)
+        latents = torch.randn(latent_shape, device=device, generator=generator)
         
-        # Scheduler 초기화
+        # 3. Scheduler 설정
         self.scheduler.set_timesteps(num_inference_steps)
         latents = latents * self.scheduler.init_noise_sigma
         
-        # 4. Denoising Loop
+        # 4. Null embedding for CFG
+        null_embed = self.null_audio_embed.expand(B, -1, -1).to(device)
+        
+        # 5. Denoising loop
         for t in self.scheduler.timesteps:
-            # CFG를 위한 입력 복제 (Unconditional + Conditional)
-            # 여기서는 간단하게 구현 (필요시 Uncond embedding 추가 필요)
-            # 현재는 guidance 없이 conditional만 수행하는 구조로 단순화
+            t_tensor = t.to(device)
             
-            # U-Net Forward
-            noise_pred = self.storyboard_unet(
-                sample=latents,
-                timestep=t,
-                audio_embeds=audio_emb_flat,
-                text_embeds=text_embed_flat
-            )
+            if guidance_scale > 1.0:
+                latent_input = torch.cat([latents] * 2)
+                
+                # Prepare conditional/unconditional inputs based on mode
+                if conditioning_mode == "audio":
+                    cond_embed = audio_embeds
+                    uncond_embed = null_embed
+                    audio_input = torch.cat([uncond_embed, cond_embed])
+                    text_input = None
+                elif conditioning_mode == "text":
+                    cond_embed = text_embed
+                    uncond_embed = self.null_text_embed.expand(B, -1, -1).to(device)
+                    audio_input = None
+                    text_input = torch.cat([uncond_embed, cond_embed])
+                else:  # both
+                    audio_input = torch.cat([null_embed, audio_embeds])
+                    null_text = self.null_text_embed.expand(B, -1, -1).to(device)
+                    text_input = torch.cat([null_text, text_embed])
+                
+                noise_pred = self.storyboard_unet(
+                    latent_input,
+                    t_tensor.expand(B * 2),
+                    audio_input,
+                    text_input,
+                    conditioning_mode=conditioning_mode
+                )
+                
+                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            else:
+                noise_pred = self.storyboard_unet(
+                    latents,
+                    t_tensor.expand(B),
+                    audio_embeds,
+                    text_embed,
+                    conditioning_mode=conditioning_mode
+                )
             
-            # Scheduler Step
             latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-            
-        # 5. VAE Decode
-        # Scaling Factor 보정
-        latents = latents / 0.18215
-        images = self.vae.decode(latents).sample
         
-        # [B*4, 3, 512, 512] -> [0, 1] 범위로 변환
-        images = (images / 2 + 0.5).clamp(0, 1)
+        # 6. VAE decode (동일)
+        latents = latents / self.vae_scale_factor
+        frame_latents = self._split_latents(latents)
         
-        # [B, 4, 3, 512, 512] 형태로 복원
-        images = images.view(B, NumFrames, 3, 512, 512)
+        images = []
+        for i in range(4):
+            frame = self.vae.decode(frame_latents[:, i]).sample
+            frame = (frame / 2 + 0.5).clamp(0, 1)
+            images.append(frame)
         
-        return images
+        return torch.stack(images, dim=1)

@@ -74,6 +74,7 @@ def train(config_path: str):
     # Trainable parameters
     trainable_params = list(model.audio_encoder.parameters())
     trainable_params += [model.null_audio_embed]  # CFG용 null embedding
+    trainable_params += [model.null_text_embed]
     
     if not config['model']['freeze_unet']:
         trainable_params += list(model.storyboard_unet.unet.parameters())
@@ -105,6 +106,10 @@ def train(config_path: str):
     # Output dir
     os.makedirs(config['output_dir'], exist_ok=True)
     
+    # Conditioning mode
+    conditioning_mode = config['training'].get('conditioning_mode', 'both')
+    print(f"🎯 Conditioning mode: {conditioning_mode}")
+    
     # Training loop
     global_step = 0
     best_val_loss = float('inf')
@@ -129,7 +134,8 @@ def train(config_path: str):
                     mel=mel,
                     latent=latent,
                     text_embed=text_embed,
-                    mel_mask=mel_mask
+                    mel_mask=mel_mask,
+                    conditioning_mode=conditioning_mode
                 )
                 # Gradient accumulation을 위해 loss 나누기
                 loss = output['loss'] / grad_accum_steps
@@ -176,7 +182,7 @@ def train(config_path: str):
         
         # Validation
         if (epoch + 1) % config['training']['eval_every'] == 0:
-            val_loss = validate(model, val_loader, device, scaler)
+            val_loss = validate(model, val_loader, device, scaler, conditioning_mode)
             print(f"📊 Epoch {epoch+1} - Val Loss: {val_loss:.4f}")
             
             wandb.log({
@@ -212,6 +218,7 @@ def save_checkpoint(model, optimizer, epoch, loss, path, freeze_unet):
         'epoch': epoch,
         'audio_encoder_state_dict': model.audio_encoder.state_dict(),
         'null_audio_embed': model.null_audio_embed.data,
+        'null_text_embed': model.null_text_embed.data,
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss
     }
@@ -224,7 +231,7 @@ def save_checkpoint(model, optimizer, epoch, loss, path, freeze_unet):
 
 
 @torch.no_grad()
-def validate(model, val_loader, device, scaler=None):
+def validate(model, val_loader, device, scaler=None, conditioning_mode="both"):
     model.eval()
     total_loss = 0.0
     
@@ -239,7 +246,8 @@ def validate(model, val_loader, device, scaler=None):
                 mel=mel,
                 latent=latent,
                 text_embed=text_embed,
-                mel_mask=mel_mask
+                mel_mask=mel_mask,
+                conditioning_mode=conditioning_mode
             )
         
         total_loss += output['loss'].item()

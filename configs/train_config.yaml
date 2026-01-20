@@ -25,6 +25,7 @@ training:
   warmup_steps: 500
   save_every: 10
   eval_every: 5
+  conditioning_mode: "both"  # "audio", "text", "both"
 
 seed: 42
 mixed_precision: "fp16"
