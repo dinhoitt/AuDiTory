@@ -3,7 +3,7 @@
 data:
   features_dir: "/content/drive/MyDrive/Colab Notebooks/ECCV2026/SonicStory_Features"
   features_json: "dataset_features.json"
-  max_mel_length: 2048
+  max_mel_length: 8192
 
 model:
   pretrained_model: "runwayml/stable-diffusion-v1-5"
@@ -16,12 +16,15 @@ model:
     output_seq_len: 77  # CLIP과 동일하게 변경
   freeze_unet: true
   use_lora: false
+  use_consistent_attention: true  # Consistent Self-Attention for character consistency
+  num_frames: 4  # Number of frames in storyboard
+  attention_mode: "first"  # "first" (첫 장 참조) or "mutual" (상호 참조)
 
 training:
   batch_size: 2
   gradient_accumulation_steps: 8  # effective batch = 16
   learning_rate: 1.0e-4
-  num_epochs: 100
+  num_epochs: 300
   warmup_steps: 500
   save_every: 10
   eval_every: 5

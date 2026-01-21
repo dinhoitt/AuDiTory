@@ -68,7 +68,10 @@ def train(config_path: str):
     model = AudioToStoryboardPipeline(
         pretrained_model=config['model']['pretrained_model'],
         audio_encoder_config=config['model']['audio_encoder'],
-        freeze_unet=config['model']['freeze_unet']
+        freeze_unet=config['model']['freeze_unet'],
+        use_consistent_attention=config['model'].get('use_consistent_attention', True),
+        num_frames=config['model'].get('num_frames', 4),
+        attention_mode=config['model'].get('attention_mode', 'first'),
     ).to(device)
     
     # Trainable parameters
