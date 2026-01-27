@@ -72,6 +72,7 @@ def train(config_path: str):
         use_consistent_attention=config['model'].get('use_consistent_attention', True),
         num_frames=config['model'].get('num_frames', 4),
         attention_mode=config['model'].get('attention_mode', 'first'),
+        align_weight=config['model'].get('align_weight', 0.1),  # Audio-Text Alignment Loss
     ).to(device)
     
     # Trainable parameters
@@ -168,16 +169,23 @@ def train(config_path: str):
                 
                 # Logging
                 if global_step % 50 == 0:
-                    wandb.log({
+                    log_dict = {
                         'train/loss': output['loss'].item(),
                         'train/lr': scheduler.get_last_lr()[0],
                         'train/epoch': epoch
-                    }, step=global_step)
+                    }
+                    # Auxiliary losses (if available)
+                    if 'diffusion_loss' in output:
+                        log_dict['train/diffusion_loss'] = output['diffusion_loss'].item()
+                    if 'align_loss' in output:
+                        log_dict['train/align_loss'] = output['align_loss'].item()
+                    wandb.log(log_dict, step=global_step)
             
-            pbar.set_postfix({
-                'loss': f"{output['loss'].item():.4f}",
-                'lr': f"{scheduler.get_last_lr()[0]:.2e}"
-            })
+            # Progress bar with align_loss
+            postfix = {'loss': f"{output['loss'].item():.4f}", 'lr': f"{scheduler.get_last_lr()[0]:.2e}"}
+            if 'align_loss' in output:
+                postfix['align'] = f"{output['align_loss'].item():.4f}"
+            pbar.set_postfix(postfix)
         
         # Epoch end
         avg_train_loss = epoch_loss / len(train_loader)

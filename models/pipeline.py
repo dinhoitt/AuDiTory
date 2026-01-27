@@ -33,6 +33,7 @@ class AudioToStoryboardPipeline(nn.Module):
         use_consistent_attention: bool = True,
         num_frames: int = 4,
         attention_mode: str = "first",  # "first" or "mutual"
+        align_weight: float = 0.1,  # Audio-Text Alignment Loss 가중치
     ):
         super().__init__()
         
@@ -48,6 +49,7 @@ class AudioToStoryboardPipeline(nn.Module):
         
         self.num_frames = num_frames
         self.use_consistent_attention = use_consistent_attention
+        self.align_weight = align_weight  # Audio-Text Alignment Loss 가중치
         
         # 1. Audio Encoder
         self.audio_encoder = AudioEncoder(**audio_encoder_config)
@@ -97,7 +99,7 @@ class AudioToStoryboardPipeline(nn.Module):
             conditioning_mode: "audio", "text", or "both"
         
         Returns:
-            dict with 'loss', 'noise_pred', 'noise', 'timesteps'
+            dict with 'loss', 'diffusion_loss', 'align_loss', 'noise_pred', 'noise', 'timesteps'
         """
         if mel is not None:
             B = mel.shape[0]
@@ -110,11 +112,16 @@ class AudioToStoryboardPipeline(nn.Module):
         
         # 1. Audio encoding (if needed)
         audio_embeds = None
+        audio_embeds_original = None  # Align loss 계산용 원본 저장
         if conditioning_mode in ["audio", "both"]:
             if mel is None:
                 raise ValueError(f"mel required for '{conditioning_mode}' mode")
             # [B, 77, 768]
             audio_embeds = self.audio_encoder(mel, mel_mask)
+            audio_embeds_original = audio_embeds  # 확장 전 원본 저장
+        
+        # 원본 text_embed 저장 (Align loss 계산용)
+        text_embed_original = text_embed  # [B, 77, 768]
         
         # 2. Latent 준비: [B, 4, 4, 64, 64] → [B*4, 4, 64, 64]
         # 각 프레임을 별도 배치로 펼침
@@ -151,11 +158,29 @@ class AudioToStoryboardPipeline(nn.Module):
             conditioning_mode=conditioning_mode
         )
         
-        # 7. Loss
-        loss = F.mse_loss(noise_pred, noise)
+        # 7. Loss 계산
+        # 7.1 Main Loss: Diffusion Loss (MSE)
+        diffusion_loss = F.mse_loss(noise_pred, noise)
+        
+        # 7.2 Auxiliary Loss: Audio-Text Alignment Loss
+        align_loss = torch.tensor(0.0, device=device)
+        if (text_embed_original is not None and 
+            audio_embeds_original is not None and 
+            self.align_weight > 0):
+            # 전체 시퀀스 평균으로 비교 (Global Semantic Match)
+            # [B, 77, 768] -> [B, 768]
+            audio_pooled = F.normalize(audio_embeds_original.mean(dim=1), dim=-1)
+            text_pooled = F.normalize(text_embed_original.mean(dim=1), dim=-1)
+            # Cosine Distance (1 - Similarity)
+            align_loss = 1 - (audio_pooled * text_pooled).sum(dim=-1).mean()
+        
+        # 7.3 Total Loss
+        total_loss = diffusion_loss + (self.align_weight * align_loss)
         
         return {
-            'loss': loss,
+            'loss': total_loss,
+            'diffusion_loss': diffusion_loss,
+            'align_loss': align_loss,
             'noise_pred': noise_pred,
             'noise': noise,
             'timesteps': timesteps
