@@ -19,18 +19,18 @@ model:
   use_consistent_attention: true  # Consistent Self-Attention for character consistency
   num_frames: 4  # Number of frames in storyboard
   attention_mode: "first"  # "first" (첫 장 참조) or "mutual" (상호 참조)
-  align_weight: 0.1  # Audio-Text Alignment Loss 가중치 (Audio가 Text 공간에 정렬되도록)
+  align_weight: 1.0  # Audio-Text Alignment Loss 가중치 (Audio가 Text 공간에 정렬되도록)
 
 training:
-  batch_size: 2
-  gradient_accumulation_steps: 8  # effective batch = 16
-  learning_rate: 1.0e-4
-  num_epochs: 300
-  warmup_steps: 500
-  save_every: 10
+  batch_size: 4
+  gradient_accumulation_steps: 8  # effective batch = 32
+  learning_rate: 0.000005
+  num_epochs: 100
+  warmup_steps: 0
+  save_every: 1
   eval_every: 5
   conditioning_mode: "both"  # "audio", "text", "both"
 
 seed: 42
-mixed_precision: "fp16"
+mixed_precision: "fp32"
 output_dir: "/content/drive/MyDrive/Colab Notebooks/ECCV2026/checkpoints"

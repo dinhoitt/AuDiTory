@@ -163,16 +163,27 @@ class AudioToStoryboardPipeline(nn.Module):
         diffusion_loss = F.mse_loss(noise_pred, noise)
         
         # 7.2 Auxiliary Loss: Audio-Text Alignment Loss
-        align_loss = torch.tensor(0.0, device=device)
+        align_loss = torch.tensor(0.0, device=device, requires_grad=True)
         if (text_embed_original is not None and 
             audio_embeds_original is not None and 
             self.align_weight > 0):
-            # 전체 시퀀스 평균으로 비교 (Global Semantic Match)
-            # [B, 77, 768] -> [B, 768]
-            audio_pooled = F.normalize(audio_embeds_original.mean(dim=1), dim=-1)
-            text_pooled = F.normalize(text_embed_original.mean(dim=1), dim=-1)
-            # Cosine Distance (1 - Similarity)
-            align_loss = 1 - (audio_pooled * text_pooled).sum(dim=-1).mean()
+            # 1. 평균 구하기: [B, 77, 768] -> [B, 768]
+            audio_mean = audio_embeds_original.mean(dim=1)
+            text_mean = text_embed_original.mean(dim=1)
+            
+            # 2. 정규화 (eps 파라미터로 분모가 0일 때만 보호)
+            audio_pooled = F.normalize(audio_mean, p=2, dim=-1, eps=1e-8)
+            text_pooled = F.normalize(text_mean, p=2, dim=-1, eps=1e-8)
+            
+            # 3. 코사인 유사도 계산
+            cosine_sim = (audio_pooled * text_pooled).sum(dim=-1)
+            
+            # 4. NaN/Inf 방어 및 Loss 계산
+            if torch.isnan(cosine_sim).any() or torch.isinf(cosine_sim).any():
+                print("⚠️ NaN/Inf detected in Align Loss, skipping this batch.")
+                align_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            else:
+                align_loss = 1 - cosine_sim.mean()
         
         # 7.3 Total Loss
         total_loss = diffusion_loss + (self.align_weight * align_loss)
