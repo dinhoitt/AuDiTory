@@ -19,12 +19,18 @@ model:
   use_consistent_attention: true  # Consistent Self-Attention for character consistency
   num_frames: 4  # Number of frames in storyboard
   attention_mode: "first"  # "first" (첫 장 참조) or "mutual" (상호 참조)
-  align_weight: 1.0  # Audio-Text Alignment Loss 가중치 (Audio가 Text 공간에 정렬되도록)
+  align_weight: 2.0  # Audio-Text Alignment Loss 가중치 (Audio가 Text 공간에 정렬되도록)
+  # Decoupled Cross-Attention 설정
+  fusion_type: "cross_attn"           # "add", "gate", "cross_attn" 중 선택
+  use_audio_projector: false   # Audio 토큰 압축 여부
+  audio_tokens: 16             # 압축 시 토큰 수
+  audio_scale: 1.0             # Audio contribution scale (학습됨)
+
 
 training:
   batch_size: 4
   gradient_accumulation_steps: 8  # effective batch = 32
-  learning_rate: 0.000005
+  learning_rate: 0.00005
   num_epochs: 100
   warmup_steps: 0
   save_every: 1
