@@ -228,6 +228,9 @@ def train(args):
         valid_batches = 0
         optimizer.zero_grad()
         
+        # Fixed align_weight (no progressive training)
+        current_align_weight = model.align_weight
+        
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['training']['num_epochs']}")
         
         for batch_idx, batch in enumerate(pbar):

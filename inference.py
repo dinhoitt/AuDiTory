@@ -402,14 +402,17 @@ def inference(args):
     
     with torch.no_grad():
         images = model.generate(
-            mel=mel,
+            audio_embed=audio_embeds if mel is not None else None,
             text_embed=text_embed,
             num_inference_steps=args.steps,
             guidance_scale=args.guidance,
             conditioning_mode=conditioning_mode,
             generator=generator,
-            use_consistent_attention=use_consistent,
         )
+    
+    # Add batch dimension if needed: [4, 3, H, W] -> [1, 4, 3, H, W]
+    if images.dim() == 4:
+        images = images.unsqueeze(0)
     
     print(f"✅ Generated images shape: {images.shape}")  # [B, 4, 3, H, W]
     

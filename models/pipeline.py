@@ -211,6 +211,13 @@ class AudioToStoryboardPipeline(nn.Module):
             subfolder="scheduler",
         )
         
+        # 7. VAE (for decoding latents to images)
+        self.vae = AutoencoderKL.from_pretrained(
+            pretrained_model,
+            subfolder="vae",
+        )
+        self.vae.requires_grad_(False)
+        
         # 7. Null embeddings for CFG
         self.null_audio_embed = nn.Parameter(torch.zeros(1, 77, 768))
         self.null_text_embed = nn.Parameter(torch.zeros(1, 77, 768))
@@ -479,7 +486,14 @@ class AudioToStoryboardPipeline(nn.Module):
             # Step
             latents = self.scheduler.step(noise_pred, t, latents).prev_sample
         
-        return latents
+        # Decode latents to images
+        latents = latents / self.vae.config.scaling_factor
+        images = self.vae.decode(latents).sample
+        
+        # Normalize to [0, 1]
+        images = (images / 2 + 0.5).clamp(0, 1)
+        
+        return images
     
     def get_trainable_parameters(self) -> List[nn.Parameter]:
         """
